@@ -1,0 +1,204 @@
+from pathlib import Path
+from pandas import read_csv
+from numpy import floor
+from preprocess import load_and_preprocess_image
+from spacecutter.models import OrdinalLogisticModel
+from spacecutter.losses import CumulativeLinkLoss
+import torch
+from torch_geometric.data import Dataset
+from torch.utils.data import DataLoader
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os.path as osp
+
+# Import the GCN model
+from gcn import GCN  # Make sure this matches the actual file where GCN is defined
+
+# Initialize device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")# Load the dataset
+data = read_csv("virtual.real.stages.csv")
+data.drop(columns=data.columns[0], axis=1, inplace=True)  # remove first column (unnamed)
+data.drop(data[data["virtual"] == True].index, inplace=True)  # ignore all virtual calls
+data = data.dropna(subset=["value"])  # remove rows where value is NA
+data["value"] = data.apply(lambda row: int(floor(row["value"])), axis=1)
+data["path"] = data.apply(lambda row: Path(f"{row['image']}_tri.npy"), axis=1)
+
+print(f"Dataset has {data['image'].nunique()} images and {data['value'].count()} stage labels in total.")
+
+num_classes = 5  # F0-F4# Define the custom dataset class
+class GraphWSIDataset(Dataset):
+    def __init__(self, root, transform=None, pre_transform=None):
+        super(GraphWSIDataset, self).__init__(root, transform, pre_transform)
+
+    @property
+    def raw_file_names(self):
+        return data["path"].tolist()
+
+    @property
+    def processed_file_names(self):
+        return [
+            raw_path.parent.parent / "liver_fibrosis/processed" / f"data_{i}.pt"
+            for i, raw_path in enumerate(self.raw_file_names)
+        ]
+
+    def process(self):
+        paths = data.apply(lambda row: Path() / "raw" / row["path"], axis=1)
+        valid_paths = frozenset((i, path) for i, path in enumerate(paths) if path.exists())
+
+        for i, raw_path in valid_paths:
+            if (Path() / "processed" / f"data_{i}.pt").exists():
+                continue
+            wsi = load_and_preprocess_image(raw_path)
+            graph = build_graph(
+                wsi,
+                data.iloc[i]["value"],
+                case_id=data.iloc[i]["image"],
+                image_id=data.iloc[i]["image"],
+            )
+
+            if self.pre_filter is not None and not self.pre_filter(graph):
+                continue
+
+            if self.pre_transform is not None:
+                graph = self.pre_transform(graph)
+
+            torch.save(graph, osp.join(self.processed_dir, f"data_{i}.pt"))
+
+    def len(self):
+        return len(self.processed_file_names)
+
+    def get(self, idx):
+        pt_path = Path() / "liver_fibrosis/processed" / f"data_{idx}.pt"
+        if pt_path.exists():
+            return torch.load(pt_path)
+        else:
+            return None# Main execution
+dataset = GraphWSIDataset(root=".")
+
+# Filter out None graphs
+dataset_not_none_idx = [i for i, graph in enumerate(dataset) if graph is not None]
+dataset = dataset[dataset_not_none_idx]
+
+# Split the dataset into training, validation, and test sets
+train_idx, val_test_idx = next(
+    GroupShuffleSplit(n_splits=1, train_size=0.7).split(
+        dataset, [graph.y for graph in dataset], [graph.case_id for graph in dataset]
+    )
+)
+dataset_train = dataset[train_idx]
+val_idx, test_idx = next(
+    GroupShuffleSplit(n_splits=1, train_size=0.5).split(
+        dataset[val_test_idx], [graph.y for graph in dataset[val_test_idx]], [graph.case_id for graph in dataset[val_test_idx]]
+    )
+)
+dataset_val = dataset[val_test_idx][val_idx]
+dataset_test = dataset[val_test_idx][test_idx]# Model initialization
+model = OrdinalLogisticModel(GCN(dataset.num_node_features, num_classes), num_classes=num_classes).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+
+# Compute class weights
+class_weights = compute_class_weight("balanced", classes=data["value"].unique(), y=data["value"].values)
+loss_fn = CumulativeLinkLoss(class_weights=class_weights)
+
+# Variables to track the best validation loss and training progress
+best_val_loss = float("inf")
+train_losses, val_losses, train_accuracies, val_accuracies = [], [], [], []for epoch in range(280):
+    model.train()
+    running_train_loss = 0.0
+    y_true_train, y_pred_train = [], []
+
+    for graph in dataset_train:
+        graph = graph.to(device)
+        optimizer.zero_grad()
+        out = model(graph.x, graph.edge_index)
+        loss = loss_fn(out, graph.y[None, None])
+        loss.backward()
+        optimizer.step()
+        running_train_loss += loss.item()
+        
+        # Track predictions for accuracy calculation
+        y_pred_train.extend(out.argmax(dim=1).cpu().numpy())
+        y_true_train.extend(graph.y.view(-1).cpu().numpy())  # Ensure graph.y is 1-dimensional
+
+    avg_train_loss = running_train_loss / len(dataset_train)
+    train_accuracy = accuracy_score(y_true_train, y_pred_train)
+
+    model.eval()
+    running_val_loss = 0.0
+    y_true_val, y_pred_val = [], []
+
+    with torch.no_grad():
+        for graph in dataset_val:
+            graph = graph.to(device)
+            out = model(graph.x, graph.edge_index)
+            loss = loss_fn(out, graph.y[None, None])
+            running_val_loss += loss.item()
+            
+            # Track predictions for accuracy calculation
+            y_pred_val.extend(out.argmax(dim=1).cpu().numpy())
+            y_true_val.extend(graph.y.view(-1).cpu().numpy())  # Ensure graph.y is 1-dimensional
+
+    avg_val_loss = running_val_loss / len(dataset_val)
+    val_accuracy = accuracy_score(y_true_val, y_pred_val)
+
+    train_losses.append(avg_train_loss)
+    val_losses.append(avg_val_loss)
+    train_accuracies.append(train_accuracy)
+    val_accuracies.append(val_accuracy)
+
+    print(f"epoch {epoch}; train loss {avg_train_loss:.4f}; validation loss {avg_val_loss:.4f}; "
+          f"train accuracy {train_accuracy:.4f}; validation accuracy {val_accuracy:.4f}; cutpoints {model.link.cutpoints}")
+
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        torch.save(model.state_dict(), f"best_model_epoch_{epoch}.pt")# Evaluate on the test set
+model.eval()
+y_pred_test, y_true_test = [], []
+
+with torch.no_grad():
+    for graph in dataset_test:
+        graph = graph.to(device)
+        out = model(graph.x, graph.edge_index)
+        
+        # Ensure graph.y is a tensor and convert it to a 1D numpy array
+        y_pred_test.extend(out.argmax(dim=1).cpu().numpy())
+        y_true_test.extend(graph.y.view(-1).cpu().numpy())  # view(-1) flattens the tensor if needed
+
+# Generate classification report
+print(classification_report(y_true_test, y_pred_test))
+
+# Calculate and print overall testing accuracy
+test_accuracy = accuracy_score(y_true_test, y_pred_test)
+print(f"Testing accuracy: {test_accuracy:.4f}")
+
+# Confusion matrix
+cm = confusion_matrix(y_true_test, y_pred_test)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=range(num_classes), yticklabels=range(num_classes))
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.title('Confusion Matrix')
+plt.show()
+
+# Plot Loss and Accuracy graphs
+epochs_range = range(280)
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, train_losses, label='Train Loss')
+plt.plot(epochs_range, val_losses, label='Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend(loc='upper right')
+plt.title('Loss over Epochs')
+
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, train_accuracies, label='Train Accuracy')
+plt.plot(epochs_range, val_accuracies, label='Validation Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend(loc='lower right')
+plt.title('Accuracy over Epochs')
+
+plt.show().   
